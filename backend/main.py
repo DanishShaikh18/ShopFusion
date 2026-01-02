@@ -12,6 +12,16 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os
 
+from dotenv import load_dotenv, find_dotenv
+
+env_path = find_dotenv()
+if env_path:
+    load_dotenv(env_path)
+else:
+    load_dotenv()
+
+
+
 from app.api import product as product_router_module
 
 app = FastAPI(title="Product Search API")
