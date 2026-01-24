@@ -1,3 +1,4 @@
+#backend\main.py
 """
 Minimal FastAPI application entrypoint for the Product Search API.
 

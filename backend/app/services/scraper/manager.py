@@ -3,24 +3,23 @@ from __future__ import annotations
 
 import os
 import time
-import logging
 import math
+import logging
 from typing import Dict, List, Optional, Tuple
-from collections import defaultdict
 
 from dotenv import load_dotenv, find_dotenv
-load_dotenv(find_dotenv())
-
-
-from .. import scraper_india  # fallback if you prefer calling directly
-from .amazon_scraper import search_amazon
 from .google_shopping_scraper import search_google_shopping
 
+load_dotenv(find_dotenv())
 logger = logging.getLogger(__name__)
 
-# Simple in-memory TTL cache
+# ------------------------------------------------------------------
+# Simple in-memory cache (DEV friendly)
+# ------------------------------------------------------------------
+
 _CACHE: Dict[str, Tuple[float, List[Dict]]] = {}
-CACHE_TTL_SECONDS = 60  # tune: 60 seconds for dev
+CACHE_TTL_SECONDS = 60
+
 
 def _cache_get(key: str) -> Optional[List[Dict]]:
     entry = _CACHE.get(key)
@@ -32,122 +31,241 @@ def _cache_get(key: str) -> Optional[List[Dict]]:
         return None
     return value
 
+
 def _cache_set(key: str, value: List[Dict]) -> None:
     _CACHE[key] = (time.time(), value)
 
-def _normalize_title_for_key(title: str) -> str:
-    if not title:
-        return ""
-    s = title.lower()
-    s = "".join(ch if ch.isalnum() else " " for ch in s)
-    return " ".join(s.split())
 
-def _dedupe_and_merge(items: List[Dict], max_results: int) -> List[Dict]:
-    """
-    Deduplicate by normalized title and link. Keep the best-scoring entry for each group.
-    """
-    groups = {}
-    for it in items:
-        key_candidates = []
-        title_key = _normalize_title_for_key(it.get("title") or "")
-        if it.get("link"):
-            key_candidates.append(it.get("link"))
-        if title_key:
-            key_candidates.append(title_key[:120])  # limit key length
-        # choose first key candidate as group key
-        if not key_candidates:
-            continue
-        gk = key_candidates[0]
-        if gk not in groups:
-            groups[gk] = it
-        else:
-            # merge: prefer lower price if available, or higher rating
-            existing = groups[gk]
-            # pick cheaper if both have price
-            p_new = it.get("price")
-            p_old = existing.get("price")
-            if p_new is not None and p_old is not None:
-                if p_new < p_old:
-                    groups[gk] = it
-            else:
-                # fallback to rating
-                r_new = it.get("rating") or 0
-                r_old = existing.get("rating") or 0
-                if r_new > r_old:
-                    groups[gk] = it
+# ------------------------------------------------------------------
+# Source trust
+# ------------------------------------------------------------------
 
-    out = list(groups.values())
-    # simple sorting: prefer items with price (low), higher rating
-    out.sort(key=lambda x: ((x.get("price") is None), x.get("price") or math.inf, -(x.get("rating") or 0.0)))
-    return out[:max_results]
+SOURCE_TRUST = {
+    "amazon": 1.00,
+    "flipkart": 0.98,
+    "myntra": 0.94,
+    "nykaa": 0.93,
+    "tira": 0.92,
+    "sephora": 0.92,
+    "tatacliq": 0.90,
+    "tatacliq_luxury": 0.88,
+    "croma": 0.90,
+    "reliance": 0.90,
+    "cashify": 0.70,
+    "easyphones": 0.60,
+    "meesho": 0.86,
+    "alibaba": 0.30,
+    "ali_express": 0.40,
+}
 
-def _score_item_brand_model(item: Dict, query: str) -> float:
-    """
-    Lightweight scoring: brand presence and model token match (simple heuristics).
-    Returns score in 0..1
-    """
-    q = query.lower()
-    title = (item.get("title") or "").lower()
+
+def _get_trust_score(source: str) -> float:
+    if not source:
+        return 0.5
+    s = source.lower()
+    for key, score in SOURCE_TRUST.items():
+        if key in s:
+            return score
+    return 0.5
+
+
+# ------------------------------------------------------------------
+# Merchant search redirect support
+# ------------------------------------------------------------------
+
+MERCHANT_SEARCH_URLS = {
+    "amazon": "https://www.amazon.in/s?k={query}",
+    "flipkart": "https://www.flipkart.com/search?q={query}",
+    "myntra": "https://www.myntra.com/{query}",
+    "nykaa": "https://www.nykaa.com/search/result/?q={query}",
+    "tira": "https://www.tirabeauty.com/search?q={query}",
+    "sephora": "https://www.sephora.in/search?q={query}",
+    "tatacliq": "https://www.tatacliq.com/search/?searchCategory=all&text={query}",
+    "croma": "https://www.croma.com/search/?text={query}",
+    "reliance": "https://www.reliancedigital.in/search?q={query}",
+}
+
+
+def _is_google_redirect(url: str) -> bool:
+    return "google.com/search" in url or "google.com/shopping" in url
+
+
+def _build_merchant_search_link(source: str, query: str) -> Optional[str]:
+    if not source:
+        return None
+    s = source.lower()
+    for key, template in MERCHANT_SEARCH_URLS.items():
+        if key in s:
+            return template.format(query=query.replace(" ", "+"))
+    return None
+
+
+# ------------------------------------------------------------------
+# Filters & scoring
+# ------------------------------------------------------------------
+
+IGNORE_KEYWORDS = {
+    "cover", "case", "charger", "adapter", "cable", "protector",
+    "screen guard", "tempered", "back cover", "earphone", "headphone"
+}
+
+
+def _is_irrelevant(title: str) -> bool:
+    title = title.lower()
+    return any(word in title for word in IGNORE_KEYWORDS)
+
+
+def _score_item(item: Dict, query: str) -> float:
     score = 0.0
-    # exact tokens
-    for tok in q.split():
-        if tok and tok in title:
-            score += 0.2
-    # small bonus for rating and price present
+    title = (item.get("title") or "").lower()
+    q_tokens = query.lower().split()
+
+    for tok in q_tokens:
+        if tok in title:
+            score += 0.25
+
     if item.get("rating"):
-        score += 0.15
+        score += 0.20
+
     if item.get("price") is not None:
-        score += 0.1
+        score += 0.15
+
     return min(score, 1.0)
 
-def search_all(query: str, max_results: int = 6, sources: Optional[List[str]] = None, api_key: Optional[str] = None) -> List[Dict]:
-    """
-    Orchestrator: call multiple scrapers, merge/dedupe, score, and return top results.
-    sources: list of strings: "amazon", "google_shopping" etc. Default: both.
-    """
-    if not sources:
-        sources = ["amazon", "google_shopping"]
 
-    # simple cache key
-    cache_key = f"{query}::{'|'.join(sources)}::{max_results}"
+def _filter_price_outliers(items: List[Dict]) -> List[Dict]:
+    prices = [i["price"] for i in items if isinstance(i.get("price"), (int, float))]
+    if len(prices) < 3:
+        return items
+
+    prices.sort()
+    mid = len(prices) // 2
+    median = prices[mid] if len(prices) % 2 else (prices[mid - 1] + prices[mid]) / 2
+
+    low = median * 0.4
+    high = median * 2.5
+
+    return [
+        i for i in items
+        if i.get("price") is None or (low <= i["price"] <= high)
+    ]
+
+
+def _normalize_title_key(title: str) -> str:
+    return "".join(ch.lower() if ch.isalnum() else " " for ch in title).strip()
+
+
+def _dedupe(items: List[Dict]) -> List[Dict]:
+    seen = {}
+    for item in items:
+        key = item.get("link") or _normalize_title_key(item.get("title") or "")
+        if not key:
+            continue
+
+        if key not in seen:
+            seen[key] = item
+        else:
+            old = seen[key]
+            if (
+                item.get("price") is not None
+                and old.get("price") is not None
+                and item["price"] < old["price"]
+            ):
+                seen[key] = item
+            elif (item.get("rating") or 0) > (old.get("rating") or 0):
+                seen[key] = item
+
+    return list(seen.values())
+
+
+def _recommend_best(items: List[Dict]) -> None:
+    best_item = None
+    best_score = -1.0
+
+    for item in items:
+        relevance = item.get("_score") or 0
+        rating = (item.get("rating") or 0) / 5
+        trust = _get_trust_score(item.get("source"))
+
+        final_score = (
+            relevance * 0.45 +
+            rating * 0.25 +
+            trust * 0.30
+        )
+
+        if final_score > best_score:
+            best_score = final_score
+            best_item = item
+
+    for item in items:
+        item["is_recommended"] = (item is best_item)
+
+
+# ------------------------------------------------------------------
+# PUBLIC ENTRYPOINT
+# ------------------------------------------------------------------
+
+def search_all(
+    query: str,
+    max_results: int = 6,
+    api_key: Optional[str] = None,
+) -> List[Dict]:
+
+    cache_key = f"{query}::{max_results}"
     cached = _cache_get(cache_key)
     if cached is not None:
-        logger.debug("manager: cache hit for %s", cache_key)
         return cached
 
-    api_key = api_key or os.getenv("SERPAPI_KEY")  # use env key if present
+    api_key = api_key or os.getenv("SERPAPI_KEY")
 
-    candidates = []
-    # call scrapers (sequential for simplicity). You can call them in parallel later.
-    if "amazon" in sources:
-        try:
-            candidates.extend(search_amazon(query=query, max_results=max_results, api_key=api_key))
-        except Exception as exc:
-            logger.warning("amazon scraper failed: %s", exc)
-
-    if "google_shopping" in sources:
-        try:
-            candidates.extend(search_google_shopping(api_key=api_key, query=query, max_results=max_results))
-        except Exception as exc:
-            logger.warning("google_shopping scraper failed: %s", exc)
-
-    # If nothing found, return empty list
-    if not candidates:
-        _cache_set(cache_key, [])
+    try:
+        raw_items = search_google_shopping(
+            api_key=api_key,
+            query=query,
+            max_results=max_results * 3,
+        )
+    except Exception as exc:
+        logger.warning("google shopping failed: %s", exc)
         return []
 
-    # score each candidate relative to query
-    for it in candidates:
-        it["_score"] = _score_item_brand_model(it, query)
+    cleaned: List[Dict] = []
+    for item in raw_items:
+        title = item.get("title")
+        if not title or _is_irrelevant(title):
+            continue
 
-    # sort candidates by score desc then price asc then rating desc
-    candidates.sort(key=lambda x: (-(x.get("_score") or 0.0), (x.get("price") or float("inf")), -(x.get("rating") or 0.0)))
+        item["_score"] = _score_item(item, query)
+        cleaned.append(item)
 
-    # dedupe/merge and limit
-    final = _dedupe_and_merge(candidates, max_results=max_results)
+    cleaned = _filter_price_outliers(cleaned)
 
-    # clear internal keys before returning
-    for it in final:
-        it.pop("_score", None)
-    _cache_set(cache_key, final)
-    return final
+    cleaned.sort(
+        key=lambda x: (
+            -(x.get("_score") or 0.0),
+            x.get("price") or math.inf,
+            -(x.get("rating") or 0.0),
+        )
+    )
+
+    cleaned = _dedupe(cleaned)
+    cleaned = cleaned[:max_results]
+
+    _recommend_best(cleaned)
+
+    # 🔗 Smart link handling
+    for item in cleaned:
+        link = item.get("link")
+        if link and _is_google_redirect(link):
+            merchant_link = _build_merchant_search_link(item.get("source"), query)
+            if merchant_link:
+                item["link"] = merchant_link
+                item["link_type"] = "merchant_search"
+            else:
+                item["link_type"] = "google_shopping"
+        else:
+            item["link_type"] = "direct"
+
+        item.pop("_score", None)
+
+    _cache_set(cache_key, cleaned)
+    return cleaned
